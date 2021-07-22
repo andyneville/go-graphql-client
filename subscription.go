@@ -2,6 +2,7 @@ package graphql
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,6 +55,11 @@ type OperationMessage struct {
 	Payload json.RawMessage      `json:"payload,omitempty"`
 }
 
+type AppSyncApiKeyAuthHeader struct {
+	Host     string                 `json:"host"`
+	ApiKey  string `json:"x-api-key"`
+}
+
 func (om OperationMessage) String() string {
 	bs, _ := json.Marshal(om)
 
@@ -85,6 +91,7 @@ type subscription struct {
 type SubscriptionClient struct {
 	url              string
 	conn             WebsocketConn
+	authHeader       interface{}
 	connectionParams map[string]interface{}
 	context          context.Context
 	subscriptions    map[string]*subscription
@@ -141,6 +148,12 @@ func (sc *SubscriptionClient) WithWebSocket(fn func(sc *SubscriptionClient) (Web
 // It's usually used for authentication handshake
 func (sc *SubscriptionClient) WithConnectionParams(params map[string]interface{}) *SubscriptionClient {
 	sc.connectionParams = params
+	return sc
+}
+// WithConnectionParams updates connection params for sending to server through GQL_CONNECTION_INIT event
+// It's usually used for authentication handshake
+func (sc *SubscriptionClient) WithAuthHeader(authHeader interface{}) *SubscriptionClient {
+	sc.authHeader = authHeader
 	return sc
 }
 
@@ -314,18 +327,48 @@ func (sc *SubscriptionClient) startSubscription(id string, sub *subscription) er
 		return nil
 	}
 
-	in := struct {
-		Query     string                 `json:"query"`
-		Variables map[string]interface{} `json:"variables,omitempty"`
-	}{
-		Query:     sub.query,
-		Variables: sub.variables,
+	var payload []byte
+	var err error
+	if sc.authHeader != nil {
+		data := struct {
+			Query     string                 `json:"query"`
+			Variables map[string]interface{} `json:"variables,omitempty"`
+		}{
+			Query:     sub.query,
+			Variables: sub.variables,
+		}
+		bData, _ := json.Marshal(data)
+		in := struct {
+			Data interface {} `json:"data"`
+			Extensions interface{} `json:"extensions"`
+		}{
+			Data: string(bData),
+			Extensions: struct {
+				Authorization interface{} `json:"authorization"`
+			}{
+				Authorization: sc.authHeader,
+			},
+		}
+
+		payload, err = json.Marshal(in)
+		if err != nil {
+			return err
+		}
+	} else {
+		in := struct {
+			Query     string                 `json:"query"`
+			Variables map[string]interface{} `json:"variables,omitempty"`
+		}{
+			Query:     sub.query,
+			Variables: sub.variables,
+		}
+
+		payload, err = json.Marshal(in)
+		if err != nil {
+			return err
+		}
 	}
 
-	payload, err := json.Marshal(in)
-	if err != nil {
-		return err
-	}
 
 	// send stop message to the server
 	msg := OperationMessage{
@@ -572,11 +615,15 @@ func (wh *websocketHandler) Close() error {
 }
 
 func newWebsocketConn(sc *SubscriptionClient) (WebsocketConn, error) {
-
+	url := sc.GetURL()
+	if sc.authHeader != nil {
+		bAuth, _ := json.Marshal(sc.authHeader)
+		url = url + "?header=" + base64.StdEncoding.EncodeToString(bAuth) + "&payload=e30="	// e30= is b64 for {}
+	}
 	options := &websocket.DialOptions{
 		Subprotocols: []string{"graphql-ws"},
 	}
-	c, _, err := websocket.Dial(sc.GetContext(), sc.GetURL(), options)
+	c, _, err := websocket.Dial(sc.GetContext(), url, options)
 	if err != nil {
 		return nil, err
 	}
